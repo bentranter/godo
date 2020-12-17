@@ -3,7 +3,10 @@ package godo
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -30,10 +33,33 @@ const (
 	headerRateReset     = "RateLimit-Reset"
 )
 
+// ErrNoTokenSource occurs when a client has been initialized, but an OAuth2
+// token source has not yet been set.
+var ErrNoTokenSource = errors.New("a token source has not been set")
+
 // Client manages communication with DigitalOcean V2 API.
 type Client struct {
 	// HTTP client used to communicate with the DO API.
 	client *http.Client
+
+	// initializedTokenSource is set to true once an OAuth2 token source has
+	// been set for the client.
+	//
+	// This is set by default when creating a client with every method except
+	// for `NewOAuth2`, as that method requires that the OAuth2
+	// authorization code flow is first completed before a token source is
+	// set.
+	intializedTokenSource bool
+
+	// OAuth2 config to support OAuth2 operations via Cloud.
+	oauth2Config *oauth2.Config
+
+	// The state string used in the authorize and callback steps of the OAuth2
+	// authorization flow.
+	//
+	// This is unset until `WithOAuth2Config` is called, at which point it is
+	// set to a secure random string.
+	state string
 
 	// Base URL for API requests.
 	BaseURL *url.URL
@@ -69,6 +95,7 @@ type Client struct {
 	StorageActions    StorageActionsService
 	Tags              TagsService
 	LoadBalancers     LoadBalancersService
+	OAuth2            OAuth2Service
 	Certificates      CertificatesService
 	Firewalls         FirewallsService
 	Projects          ProjectsService
@@ -182,6 +209,20 @@ func NewFromToken(token string) *Client {
 // you're in need of further customization, the godo.New method allows more
 // options, such as setting a custom URL or a custom user agent string.
 func NewClient(httpClient *http.Client) *Client {
+	client := newClient(httpClient)
+	client.intializedTokenSource = true
+	return client
+}
+
+// newClient returns a new DigitalOcean API client, using the given
+// http.Client to perform all requests.
+//
+// If initialized with this method, the initializedTokenSource field will
+// **not** be set, indicating to the HTTP client that requests should fail
+// until one has been set. This method should only be used when setting up a
+// client that relies on later estialishing a token source via the OAuth2
+// authorization flow. Generally, you'll want to use NewClient instead.
+func newClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -207,6 +248,7 @@ func NewClient(httpClient *http.Client) *Client {
 	c.Invoices = &InvoicesServiceOp{client: c}
 	c.Keys = &KeysServiceOp{client: c}
 	c.LoadBalancers = &LoadBalancersServiceOp{client: c}
+	c.OAuth2 = &OAuth2ServiceOp{client: c}
 	c.Projects = &ProjectsServiceOp{client: c}
 	c.Regions = &RegionsServiceOp{client: c}
 	c.Sizes = &SizesServiceOp{client: c}
@@ -328,6 +370,48 @@ func (c *Client) GetRate() Rate {
 	return c.Rate
 }
 
+// An OAuth2Config configures the OAuth2 authorization code flow parameters.
+//
+// TODO Improve me.
+type OAuth2Config struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+}
+
+// NewOAuth2 allows users to create a client with a token source populated
+// from an Oauth2 provider?? Not sure if this is a good method.
+//
+// TODO Consider this approach more carefully.
+// TODO Add clientOpts for further OAuth2 config.
+func NewOAuth2(oauth2Config *OAuth2Config, opts ...ClientOpt) (*Client, error) {
+	buf := make([]byte, 8)
+
+	// An error returned by rand.Read indicates a failure on the machine's
+	// CSPRNG, which is a fatal error. Execution should not continue if this
+	// occurs.
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+
+	c := newClient(nil)
+
+	c.state = hex.EncodeToString(buf)
+
+	c.oauth2Config = &oauth2.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://cloud.digitalocean.com/v1/oauth/authorize",
+			TokenURL: "https://cloud.digitalocean.com/v1/oauth/token",
+			// AuthStyle: oauth2.AuthStyleInParams,
+		},
+		RedirectURL: oauth2Config.RedirectURL,
+		Scopes:      []string{}, // TODO Allow configuration.
+	}
+	return c, nil
+}
+
 // newResponse creates a new Response for the provided http.Response
 func newResponse(r *http.Response) *Response {
 	response := Response{Response: r}
@@ -355,6 +439,10 @@ func (r *Response) populateRate() {
 // pointed to by v, or returned as an error if an API error has occurred. If v implements the io.Writer interface,
 // the raw response will be written to v, without attempting to decode it.
 func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Response, error) {
+	if !c.intializedTokenSource {
+		return nil, ErrNoTokenSource
+	}
+
 	resp, err := DoRequestWithClient(ctx, c.client, req)
 	if err != nil {
 		return nil, err
